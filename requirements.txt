@@ -1,0 +1,8 @@
+# Minimal TextArena agent requirements
+numpy>=1.24
+PyYAML>=6.0
+openai>=1.0.0
+textarena>=0.7.4
+
+# Required only for the DQN baseline.
+torch>=2.0

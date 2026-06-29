@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "textarena-llm-agent"
+version = "0.1.0"
+description = "Evolvable MINIAgent-style LLM agent for TextArena game research"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "PyYAML>=6.0",
+  "openai>=1.0.0",
+  "textarena>=0.7.4",
+]
+
+[project.optional-dependencies]
+rl = ["torch>=2.0"]
+test = ["pytest>=7.0"]
+
+[project.scripts]
+textarena-agent = "textarena_llm_agent.cli:main"
+textarena-evaluate = "textarena_llm_agent.evaluation:main"
+textarena-rl-baseline = "textarena_llm_agent.rl_baseline:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
