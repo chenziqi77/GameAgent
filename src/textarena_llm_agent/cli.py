@@ -27,7 +27,20 @@ def _snapshot_memory(memory_dir: Path, snapshot_root: Path, *, stage: str, stamp
     if target.exists():
         shutil.rmtree(target)
     if memory_dir.exists():
-        shutil.copytree(memory_dir, target)
+        # Checkpoint any live sqlite so the .db file is self-contained, then skip
+        # the -wal / -shm sidecars during copy (they hold live locks on Windows).
+        for db_path in memory_dir.glob("*.sqlite"):
+            try:
+                import sqlite3
+                with sqlite3.connect(str(db_path)) as _c:
+                    _c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+        shutil.copytree(
+            memory_dir,
+            target,
+            ignore=shutil.ignore_patterns("*.sqlite-wal", "*.sqlite-shm"),
+        )
     else:
         target.mkdir(parents=True, exist_ok=True)
         for name in ["experiences.jsonl", "skills.jsonl", "skill_updates.jsonl", "reflections.jsonl", "retrieval_hits.jsonl", "prompt_patches.jsonl"]:
@@ -58,8 +71,12 @@ def build_env(game: str, *, seed: int | None = None, num_players: int = 2):
     return env
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run an evolvable LLM/MINIAgent-style agent on TextArena games.")
+# ---------------------------------------------------------------------------
+# Subcommand: run (legacy default)
+# ---------------------------------------------------------------------------
+
+
+def _add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--game", default="TicTacToe", help="Game family or TextArena env id")
     parser.add_argument("--steps", type=int, default=40, help="max decision steps")
     parser.add_argument("--seed", type=int, default=7)
@@ -81,9 +98,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--open-browser", action="store_true")
     parser.add_argument("--pause-at-start", action="store_true")
     parser.add_argument("--step-delay", type=float, default=0.0)
-    args = parser.parse_args(argv)
-    stamp = _timestamp()
 
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    stamp = _timestamp()
     llm = OpenAIChatLLM.from_env() if args.llm == "openai" else HeuristicLLM()
     if args.model and isinstance(llm, OpenAIChatLLM):
         llm.model = args.model
@@ -181,6 +199,204 @@ def main(argv: list[str] | None = None) -> int:
         if server is not None:
             server.stop()
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: replay-eval
+# ---------------------------------------------------------------------------
+
+
+def _cmd_replay_eval(args: argparse.Namespace) -> int:
+    """Offline A/B over the evidence graph — no env, no LLM."""
+    from .evidence_graph import EvidenceGraph
+    from .hypothesis import replay_eval
+
+    graph_path = Path(args.graph)
+    if not graph_path.exists():
+        print(json.dumps({"error": f"evidence graph not found: {graph_path}"}))
+        return 2
+    graph = EvidenceGraph(str(graph_path))
+    try:
+        result = replay_eval(graph, policy_a=args.policy_a, policy_b=args.policy_b,
+                             limit=args.limit)
+    finally:
+        try:
+            graph.close()
+        except Exception:
+            pass
+    payload = result.to_dict()
+    out = Path(args.out) if args.out else None
+    if out:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: tournament — Elo tournament across the existing harness
+# ---------------------------------------------------------------------------
+
+
+def _cmd_tournament(args: argparse.Namespace) -> int:
+    from .evaluation import EvaluationHarness
+    games = [g.strip() for g in args.games.split(",") if g.strip()]
+    if args.llm == "openai":
+        llm = OpenAIChatLLM.from_env()
+        if args.model:
+            llm.model = args.model
+        evaluator_llm = OpenAIChatLLM.from_env(prefix=args.critic_prefix)
+        if args.critic_model:
+            evaluator_llm.model = args.critic_model
+    else:
+        llm = HeuristicLLM()
+        evaluator_llm = HeuristicLLM()
+    harness = EvaluationHarness(
+        games=games,
+        episodes=args.episodes,
+        max_steps=args.steps,
+        memory_root=Path(args.memory_root),
+        output_root=Path(args.output_dir),
+        seed=args.seed,
+        llm=llm,
+        evaluator_llm=evaluator_llm,
+        elo_rounds=args.elo_rounds,
+    )
+    out: dict[str, object] = {}
+    for game in games:
+        out_dir = Path(args.output_dir) / game
+        out_dir.mkdir(parents=True, exist_ok=True)
+        elo = harness.elo_tournament(game, out_dir, rounds=args.elo_rounds)
+        (out_dir / "elo.json").write_text(json.dumps(elo, ensure_ascii=False, indent=2), encoding="utf-8")
+        out[game] = elo
+    print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: hypothesis-report — run the harness and emit Markdown
+# ---------------------------------------------------------------------------
+
+
+def _cmd_hypothesis_report(args: argparse.Namespace) -> int:
+    from .hypothesis import (
+        DEFAULT_HYPOTHESES,
+        HypothesisHarness,
+        baseline_templates,
+    )
+
+    hypotheses = list(DEFAULT_HYPOTHESES)
+    if args.hypothesis:
+        wanted = set(args.hypothesis)
+        hypotheses = [h for h in hypotheses if h.id in wanted]
+        if not hypotheses:
+            print(json.dumps({"error": "no matching hypothesis IDs",
+                              "requested": list(wanted)}))
+            return 2
+
+    baselines = baseline_templates()
+    if args.arms:
+        wanted_arms = set(args.arms)
+        baselines = [b for b in baselines if b.id in wanted_arms]
+    games = [g.strip() for g in args.games.split(",") if g.strip()]
+
+    out_path = Path(args.out) if args.out else None
+    output_dir = out_path.parent if out_path else None
+    harness = HypothesisHarness(
+        baselines=baselines,
+        hypotheses=hypotheses,
+        games=games,
+        n_episodes=args.episodes,
+        seed=args.seed,
+        opponent=args.opponent,
+        output_dir=output_dir,
+    )
+    result = harness.run()
+    payload = result.to_dict()
+    if out_path is not None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        from .hypothesis import render_hypothesis_report
+        out_path.write_text(render_hypothesis_report(result), encoding="utf-8")
+        (out_path.parent / "hypothesis_result.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+    summary = {
+        "hypotheses": [
+            {"id": h.hypothesis_id, "passed": h.passed,
+             "metric": h.metric, "value_a": h.value_a, "value_b": h.value_b}
+            for h in result.hypotheses
+        ],
+        "arms": result.arms,
+        "n_matches": len(result.matches),
+        "report_path": str(out_path) if out_path else None,
+    }
+    print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Main / argument parser
+# ---------------------------------------------------------------------------
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Run an evolvable LLM/MINIAgent-style agent on TextArena games.",
+        prog="textarena_llm_agent",
+    )
+    sub = parser.add_subparsers(dest="cmd")
+
+    run_p = sub.add_parser("run", help="run one or more decision steps in a live environment (default)")
+    _add_run_args(run_p)
+    run_p.set_defaults(func=_cmd_run)
+
+    rep = sub.add_parser("replay-eval", help="offline A/B from the evidence graph")
+    rep.add_argument("--graph", default="workspace/textarena_memory/evidence_graph.sqlite",
+                     help="path to the evidence graph sqlite file")
+    rep.add_argument("--policy-a", required=True, dest="policy_a")
+    rep.add_argument("--policy-b", required=True, dest="policy_b")
+    rep.add_argument("--limit", type=int, default=100,
+                     help="max episodes per cohort")
+    rep.add_argument("--out", default="", help="optional output JSON path")
+    rep.set_defaults(func=_cmd_replay_eval)
+
+    tour = sub.add_parser("tournament", help="run Elo tournament across the standard pool")
+    tour.add_argument("--games", default="TicTacToe,KuhnPoker")
+    tour.add_argument("--episodes", type=int, default=20)
+    tour.add_argument("--steps", type=int, default=60)
+    tour.add_argument("--seed", type=int, default=0)
+    tour.add_argument("--memory-root", default="workspace/textarena_memory")
+    tour.add_argument("--output-dir", default="workspace/eval_runs")
+    tour.add_argument("--llm", choices=["heuristic", "openai"], default="heuristic")
+    tour.add_argument("--model", default="")
+    tour.add_argument("--critic-model", default="gpt-5.5")
+    tour.add_argument("--critic-prefix", default="CRITIC")
+    tour.add_argument("--elo-rounds", type=int, default=4)
+    tour.set_defaults(func=_cmd_tournament)
+
+    hyp = sub.add_parser("hypothesis-report",
+                         help="evaluate hypotheses across baselines and emit a Markdown report")
+    hyp.add_argument("--hypothesis", "-H", action="append", default=[],
+                     help="hypothesis ID(s) to evaluate; default is all (H1..H4)")
+    hyp.add_argument("--arms", action="append", default=[],
+                     help="restrict to the named baseline ids (default: all 9)")
+    hyp.add_argument("--games", default="TicTacToe,KuhnPoker")
+    hyp.add_argument("--episodes", type=int, default=20)
+    hyp.add_argument("--seed", type=int, default=0)
+    hyp.add_argument("--opponent", default="random",
+                     help="baseline id used as the common opponent")
+    hyp.add_argument("--out", default="workspace/eval_runs/hypothesis_report.md",
+                     help="Markdown report output path")
+    hyp.set_defaults(func=_cmd_hypothesis_report)
+
+    args = parser.parse_args(argv)
+    if not getattr(args, "cmd", None):
+        # backwards-compat: invocations without a subcommand fall back to `run`
+        _add_run_args(parser)
+        args = parser.parse_args(argv)
+        return _cmd_run(args)
+    return args.func(args)
 
 
 if __name__ == "__main__":  # pragma: no cover

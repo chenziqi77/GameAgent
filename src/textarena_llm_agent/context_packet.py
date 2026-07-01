@@ -11,10 +11,21 @@ from typing import Any
 
 @dataclass(slots=True)
 class DecisionContextPacket:
+    """Per-decision prompt payload + optional four-layer cache metadata.
+
+    The ``layer_hashes`` / ``layer_tokens`` fields are populated when the packet
+    was built via ``PromptCompiler.compile``; legacy callsites that go through
+    ``ContextBudgeter.build`` directly leave them empty. Cache observation in
+    the tracer / evidence graph relies only on these dicts being optional.
+    """
     system: str
     user: str
     sections: dict[str, str] = field(default_factory=dict)
     budget_used: int = 0
+    layer_hashes: dict[str, str] = field(default_factory=dict)
+    layer_tokens: dict[str, int] = field(default_factory=dict)
+    policy_version: str = ""
+    stable_prefix_tokens: int = 0
 
 
 class ContextBudgeter:

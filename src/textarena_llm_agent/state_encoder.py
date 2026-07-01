@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import asdict, dataclass, field
@@ -64,6 +65,30 @@ class TextArenaStateEncoder:
 
     def encode_text(self, env: Any, *, include_actions: bool = True) -> str:
         return json.dumps(self.encode(env, include_actions=include_actions), ensure_ascii=False, indent=2, default=str)
+
+    def canonical_state(self, env: Any) -> dict[str, Any]:
+        """Stable, timestamp-free state dict suitable for hashing and replay.
+
+        Drops volatile fields (rewards, logs, observations) so the same game
+        position produces the same hash across runs. Used by Evidence Graph
+        and replay-eval to detect identical decision contexts.
+        """
+        spec = spec_for_env(env)
+        state = getattr(env, "state", None)
+        current_player = int(getattr(state, "current_player_id", 0) if state is not None else 0)
+        canonical = {
+            "env_id": str(getattr(env, "env_id", spec.default_env_id)),
+            "family": spec.family,
+            "turn": int(getattr(state, "turn", 0) if state is not None else 0),
+            "current_player": current_player,
+            "num_players": int(getattr(state, "num_players", 2) if state is not None else 2),
+            "visible_state": self._visible_game_state(env, spec, current_player),
+        }
+        return _sort_keys_recursive(_safe_json(canonical))
+
+    def canonical_state_hash(self, env: Any) -> str:
+        text = json.dumps(self.canonical_state(env), ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
 
     def valid_actions(self, env: Any) -> list[ActionOption]:
         spec = spec_for_env(env)
@@ -220,6 +245,14 @@ def _safe_json(value: Any) -> Any:
         if isinstance(value, (list, tuple)):
             return [_safe_json(v) for v in value]
         return str(value)
+
+
+def _sort_keys_recursive(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _sort_keys_recursive(value[k]) for k in sorted(value.keys(), key=str)}
+    if isinstance(value, list):
+        return [_sort_keys_recursive(v) for v in value]
+    return value
 
 
 def _board_at(board: Any, row: int, col: int) -> Any:

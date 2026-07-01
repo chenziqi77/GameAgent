@@ -25,3 +25,5 @@ dist/
 workspace/**
 !workspace/.gitkeep
 *.log
+references/*/_upstream/
+.claude/

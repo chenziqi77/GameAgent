@@ -32,10 +32,16 @@ class TextArenaRunTracer:
         self.state_path = self.root / "latest_state.json"
         self.frames_path = self.root / "state_frames.jsonl"
         self.control_path = self.root / "control.json"
+        self.decision_frames_path = self.root / "decision_frames.jsonl"
+        self.episode_traces_path = self.root / "episode_traces.jsonl"
         if not self.events_path.exists():
             self.events_path.write_text("", encoding="utf-8")
         if not self.frames_path.exists():
             self.frames_path.write_text("", encoding="utf-8")
+        if not self.decision_frames_path.exists():
+            self.decision_frames_path.write_text("", encoding="utf-8")
+        if not self.episode_traces_path.exists():
+            self.episode_traces_path.write_text("", encoding="utf-8")
         if not self.control_path.exists():
             self.write_control({"paused": False, "step_requested": False, "stop_requested": False})
 
@@ -47,6 +53,27 @@ class TextArenaRunTracer:
         with self.events_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(obj, ensure_ascii=False, default=str) + "\n")
         return obj
+
+    def emit_decision_frame(self, frame: dict[str, Any]) -> dict[str, Any]:
+        """Append a DecisionFrame.to_dict() payload to decision_frames.jsonl.
+
+        Also mirrors a compact summary to events.jsonl so the dashboard
+        renders a unified timeline without reading the second file.
+        """
+        with self.decision_frames_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(frame, ensure_ascii=False, default=str) + "\n")
+        summary = {k: frame.get(k) for k in (
+            "id", "episode_id", "game_id", "turn", "step", "candidate_id",
+            "action_text", "state_hash", "policy_version",
+            "latency_ms", "prompt_tokens", "completion_tokens", "cached_tokens",
+            "cache_hit_ratio", "evaluator_overrode",
+        )}
+        return self.emit("decision_frame", summary, step=frame.get("step"))
+
+    def emit_episode_trace(self, episode: dict[str, Any]) -> dict[str, Any]:
+        with self.episode_traces_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(episode, ensure_ascii=False, default=str) + "\n")
+        return self.emit("episode_trace", episode)
 
     def update_state(self, state: dict[str, Any]) -> None:
         data = {"updated_at": datetime.now(timezone.utc).isoformat(), **state}

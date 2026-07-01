@@ -89,7 +89,7 @@ class EvolvingMemory:
     consolidation), Voyager (skill library with usage stats + verification/demotion).
     """
 
-    def __init__(self, root: str | Path = "workspace/textarena_memory") -> None:
+    def __init__(self, root: str | Path = "workspace/textarena_memory", *, graph: Any = None) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.experiences_path = self.root / "experiences.jsonl"
@@ -114,6 +114,8 @@ class EvolvingMemory:
             self.prompt_overrides_path.write_text("# Prompt Overrides\n\n", encoding="utf-8")
         # Lazy BM25 retriever (avoids import cycle at construction).
         self._retriever = None
+        # Evidence graph (SQLite) — JSONL stays the source of truth; graph is the index.
+        self.graph = graph
 
     # ------------------------------------------------------------------ recall
     def recall(self, query: str, *, max_items: int = 8, game_id: str = "", player: int | None = None, phase: str | None = None) -> list[dict[str, Any]]:
@@ -157,6 +159,16 @@ class EvolvingMemory:
         lesson = str(obj.get("lesson") or "").strip()
         if lesson:
             self.add_rule(lesson, evidence=f"experience:{exp_id}", tags=obj.get("tags") or [])
+        if self.graph is not None:
+            try:
+                self.graph.add_node(
+                    "memory", exp_id,
+                    kind="experience", game_id=str(obj.get("game_id") or ""),
+                    player=int(obj.get("player") or 0) if obj.get("player") is not None else None,
+                    do_not_learn=0, attrs=obj,
+                )
+            except Exception:
+                pass
         return exp_id
 
     def recent_experiences(self, *, game_id: str, limit: int = 200) -> list[dict[str, Any]]:
@@ -418,6 +430,15 @@ class EvolvingMemory:
             f.write(json.dumps(obj, ensure_ascii=False, default=str) + "\n")
         if obj.get("actionable_lesson"):
             self.consolidate_skill_from_lesson(lesson=str(obj["actionable_lesson"]), game_id=str(obj.get("game_id") or "unknown"), evidence=f"reflection:{rid}", tags=[str(obj.get("game_id") or "unknown"), "reflection"])
+        if self.graph is not None:
+            try:
+                self.graph.add_node(
+                    "memory", rid,
+                    kind="reflection", game_id=str(obj.get("game_id") or ""),
+                    player=None, do_not_learn=0, attrs=obj,
+                )
+            except Exception:
+                pass
         return rid
 
     def retrieve_reflections(self, *, query: str, game_id: str, top_k: int = 2) -> list[Reflection]:

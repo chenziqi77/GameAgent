@@ -160,7 +160,18 @@ class EvaluationHarness:
         if target.exists():
             shutil.rmtree(target)
         if memory_dir.exists():
-            shutil.copytree(memory_dir, target)
+            for db_path in memory_dir.glob("*.sqlite"):
+                try:
+                    import sqlite3
+                    with sqlite3.connect(str(db_path)) as _c:
+                        _c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except Exception:
+                    pass
+            shutil.copytree(
+                memory_dir,
+                target,
+                ignore=shutil.ignore_patterns("*.sqlite-wal", "*.sqlite-shm"),
+            )
         else:
             target.mkdir(parents=True, exist_ok=True)
             for name in ["experiences.jsonl", "skills.jsonl", "skill_updates.jsonl", "reflections.jsonl", "retrieval_hits.jsonl", "prompt_patches.jsonl"]:

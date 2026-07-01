@@ -158,7 +158,9 @@ class SafeToolExecutor:
 
     def _run_with_timeout(self, fn, call_args: dict[str, Any]) -> ToolExecResult:
         import time
-        if threading.current_thread() is threading.main_thread():
+        # SIGALRM is POSIX-only; on Windows fall back to the thread-based path.
+        if (hasattr(signal, "SIGALRM")
+                and threading.current_thread() is threading.main_thread()):
             return self._run_signal(fn, call_args)
         return self._run_thread(fn, call_args)
 
@@ -225,12 +227,25 @@ def _extract_open_mode(call_node: ast.Call) -> str:
 
 @dataclass(slots=True)
 class ToolSynthesizer:
-    """Ask the LLM for a reusable tool, verify it, and register it into the library."""
+    """Drive a tool through the 5-stage Voyager-style pipeline.
+
+    Stages:
+      1. ``synthesize_spec`` — LLM produces a ToolProposal; record at ``tool_spec``
+      2. ``compile_candidate`` — AST-validate + smoke run on snapshot; record at ``candidate_tool``
+      3. ``replay_eval`` — run against historical transitions; record at ``validated_tool``
+      4. ``ab_test`` — compare against current active set; record at ``active_tool``
+      5. ``activate`` — alias for the final transition (bumps version, demotes peers)
+
+    ToolValidator is the orchestrator that chains these; this class owns the
+    individual stage logic only. The legacy one-shot ``synthesize_and_register``
+    is preserved as a thin wrapper for back-compat.
+    """
     llm: DecisionLLM
     executor: SafeToolExecutor
     library: "ToolLibrary"  # type: ignore[name-defined]
     max_impl_chars: int = 4000
 
+    # ---------------------------------------------------------------- stage 1: spec
     def synthesize(self, *, task_description: str, game_id: str,
                    context_summary: str, game_state_snapshot: dict[str, Any]) -> "ToolProposal | None":
         user = (
@@ -246,6 +261,178 @@ class ToolSynthesizer:
             return None
         return _proposal_from_raw(raw, game_id=game_id, task_description=task_description)
 
+    def synthesize_spec(self, *, record_id: str, task_description: str, game_id: str,
+                        context_summary: str, game_state_snapshot: dict[str, Any]) -> dict[str, Any]:
+        """Stage 1: synthesize a spec and attach it to a ``tool_need`` row.
+
+        Returns: {ok, record_id, status, error?}
+        """
+        proposal = self.synthesize(
+            task_description=task_description, game_id=game_id,
+            context_summary=context_summary, game_state_snapshot=game_state_snapshot,
+        )
+        if proposal is None:
+            return {"ok": False, "error": "llm returned no usable proposal", "record_id": record_id}
+        rec = self.library.attach_spec(record_id=record_id, proposal=proposal)
+        if rec is None:
+            return {"ok": False, "error": "illegal transition or missing record", "record_id": record_id}
+        return {"ok": True, "record_id": rec.id, "status": rec.status, "name": rec.name}
+
+    # ---------------------------------------------------------------- stage 2: compile/candidate
+    def compile_candidate(self, *, record_id: str,
+                          game_state_snapshot: dict[str, Any],
+                          visible_text: str = "") -> dict[str, Any]:
+        """Stage 2: AST-validate, run unit tests, smoke-execute.
+
+        Promotes ``tool_spec`` -> ``candidate_tool`` on success.
+        Marks ``disabled`` on AST policy violations; ``demoted`` on runtime failures.
+        """
+        rec = self.library.get(record_id)
+        if rec is None:
+            return {"ok": False, "error": "no such record", "record_id": record_id}
+        violations = self.executor.validate_ast(rec.implementation)
+        if violations:
+            self.library.mark_status(
+                record_id=record_id, new_status="disabled",
+                reason=f"ast violations: {'; '.join(violations[:3])}",
+            )
+            return {"ok": False, "error": "ast violations", "violations": violations,
+                    "record_id": record_id, "status": "disabled"}
+        # Run up to 3 test cases.
+        tests = (rec.spec_json or {}).get("test_cases") or []
+        passed = 0
+        for tc in list(tests)[:3]:
+            args = tc.get("args") if isinstance(tc, dict) and isinstance(tc.get("args"), dict) else {}
+            res = self.executor.execute(
+                code=rec.implementation, args=args,
+                injected={"game_state": copy.deepcopy(game_state_snapshot),
+                          "visible_text": visible_text},
+            )
+            if res.ok:
+                passed += 1
+            else:
+                self.library.mark_status(
+                    record_id=record_id, new_status="demoted",
+                    reason=f"test case failed: {res.error}",
+                )
+                return {"ok": False, "error": "test case failed",
+                        "detail": res.error, "record_id": record_id, "status": "demoted"}
+        # Smoke run.
+        smoke = self.executor.execute(
+            code=rec.implementation,
+            injected={"game_state": copy.deepcopy(game_state_snapshot),
+                      "visible_text": visible_text},
+        )
+        if not smoke.ok:
+            self.library.mark_status(
+                record_id=record_id, new_status="demoted",
+                reason=f"smoke run failed: {smoke.error}",
+            )
+            return {"ok": False, "error": "smoke failed", "detail": smoke.error,
+                    "record_id": record_id, "status": "demoted"}
+        updated = self.library.mark_status(
+            record_id=record_id, new_status="candidate_tool",
+            reason="passed ast + tests + smoke",
+            scores={"unit_tests_passed": passed},
+        )
+        return {"ok": True, "record_id": record_id,
+                "status": updated.status if updated else "candidate_tool",
+                "unit_tests_passed": passed}
+
+    # ---------------------------------------------------------------- stage 3: replay eval
+    def replay_eval(self, *, record_id: str, replay_frames: list[dict[str, Any]],
+                    threshold: float = 0.6, visible_text: str = "") -> dict[str, Any]:
+        """Stage 3: run the candidate against N historical frames.
+
+        Each frame is a dict with at least ``game_state``; optional ``args``.
+        Score = fraction of frames where ``run`` returns without error.
+        Promotes ``candidate_tool`` -> ``validated_tool`` when score >= threshold.
+        """
+        rec = self.library.get(record_id)
+        if rec is None:
+            return {"ok": False, "error": "no such record", "record_id": record_id}
+        if not replay_frames:
+            return {"ok": False, "error": "no replay frames", "record_id": record_id}
+        ok_count = 0
+        for frame in replay_frames:
+            gs = frame.get("game_state") or {}
+            args = frame.get("args") if isinstance(frame.get("args"), dict) else {}
+            res = self.executor.execute(
+                code=rec.implementation, args=args,
+                injected={"game_state": copy.deepcopy(gs),
+                          "visible_text": frame.get("visible_text") or visible_text},
+            )
+            if res.ok:
+                ok_count += 1
+        score = ok_count / float(len(replay_frames))
+        if score < threshold:
+            self.library.mark_status(
+                record_id=record_id, new_status="demoted",
+                reason=f"replay score {score:.2f} below threshold {threshold:.2f}",
+                scores={"replay_score": score},
+            )
+            return {"ok": False, "error": "replay score below threshold",
+                    "replay_score": score, "record_id": record_id, "status": "demoted"}
+        updated = self.library.mark_status(
+            record_id=record_id, new_status="validated_tool",
+            reason=f"replay score {score:.2f}",
+            scores={"replay_score": score},
+        )
+        return {"ok": True, "record_id": record_id, "replay_score": score,
+                "status": updated.status if updated else "validated_tool"}
+
+    # ---------------------------------------------------------------- stage 4: A/B
+    def ab_test(self, *, record_id: str,
+                active_scores: dict[str, float] | None = None,
+                candidate_score: float | None = None,
+                min_delta: float = 0.0) -> dict[str, Any]:
+        """Stage 4: compare candidate score against best active peer.
+
+        Inputs are pre-computed (the validator owns rollouts); this just records
+        the comparison and gates promotion.
+        """
+        rec = self.library.get(record_id)
+        if rec is None:
+            return {"ok": False, "error": "no such record", "record_id": record_id}
+        cs = float(candidate_score if candidate_score is not None else rec.replay_score)
+        best_active = max((active_scores or {}).values(), default=0.0)
+        delta = cs - best_active
+        if delta < min_delta:
+            self.library.mark_status(
+                record_id=record_id, new_status="demoted",
+                reason=f"A/B delta {delta:.3f} below {min_delta:.3f}",
+                scores={"ab_score": cs},
+            )
+            return {"ok": False, "error": "A/B below threshold",
+                    "ab_score": cs, "best_active": best_active, "delta": delta,
+                    "record_id": record_id, "status": "demoted"}
+        # Stay at validated_tool; persist ab_score directly without a state transition.
+        self.library.record_ab_score(record_id=record_id, ab_score=cs)
+        return {"ok": True, "record_id": record_id, "ab_score": cs,
+                "best_active": best_active, "delta": delta,
+                "status": "validated_tool"}
+
+    # ---------------------------------------------------------------- stage 5: activate
+    def activate(self, *, record_id: str, policy_version: str = "v0") -> dict[str, Any]:
+        """Stage 5: promote ``validated_tool`` -> ``active_tool``.
+
+        Bumps version, demotes earlier active versions sharing the same name/tool_id.
+        """
+        rec = self.library.get(record_id)
+        if rec is None:
+            return {"ok": False, "error": "no such record", "record_id": record_id}
+        updated = self.library.mark_status(
+            record_id=record_id, new_status="active_tool",
+            reason="activated by validator",
+            scores={"policy_version": policy_version},
+        )
+        if updated is None:
+            return {"ok": False, "error": "illegal transition", "record_id": record_id,
+                    "status": rec.status}
+        return {"ok": True, "record_id": record_id, "status": updated.status,
+                "version": updated.version, "name": updated.name}
+
+    # ---------------------------------------------------------------- legacy helpers
     def verify(self, proposal: ToolProposal, *, game_state_snapshot: dict[str, Any],
                visible_text: str = "") -> bool:
         for tc in proposal.test_cases[:3]:
@@ -262,6 +449,11 @@ class ToolSynthesizer:
     def synthesize_and_register(self, *, task_description: str, game_id: str,
                                 context_summary: str, game_state_snapshot: dict[str, Any],
                                 visible_text: str = "") -> str | None:
+        """Legacy one-shot path: synthesize + verify + register as active.
+
+        Retained for back-compat. New code should drive the 5 stages explicitly
+        through ``ToolValidator``.
+        """
         proposal = self.synthesize(task_description=task_description, game_id=game_id,
                                    context_summary=context_summary, game_state_snapshot=game_state_snapshot)
         if proposal is None:

@@ -13,11 +13,16 @@ from .tracing import TextArenaRunTracer
 
 class TextArenaVisualizationServer:
     def __init__(self, tracer: TextArenaRunTracer, *, host: str = "127.0.0.1", port: int = 8765,
-                 eval_root: str | Path | None = None) -> None:
+                 eval_root: str | Path | None = None,
+                 evidence_graph_path: str | Path | None = None) -> None:
         self.tracer = tracer
         self.host = host
         self.port = port
         self.eval_root = Path(eval_root) if eval_root else Path("workspace/eval_runs")
+        self.evidence_graph_path = (
+            Path(evidence_graph_path) if evidence_graph_path
+            else Path("workspace/textarena_memory/evidence_graph.sqlite")
+        )
         self.httpd: ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
 
@@ -42,6 +47,7 @@ class TextArenaVisualizationServer:
     def _handler(self):
         tracer = self.tracer
         eval_root = self.eval_root
+        evidence_graph_path = self.evidence_graph_path
 
         class Handler(BaseHTTPRequestHandler):
             server_version = "TextArenaAgentVisualization/0.1"
@@ -60,6 +66,19 @@ class TextArenaVisualizationServer:
                 elif parsed.path.startswith("/api/eval/"):
                     game = parsed.path.rsplit("/", 1)[-1]
                     self._send_json(_read_eval(eval_root, game))
+                elif parsed.path == "/api/policy_versions":
+                    self._send_json(_policy_versions(evidence_graph_path))
+                elif parsed.path == "/api/cache":
+                    limit = int(parse_qs(parsed.query).get("limit", ["500"])[0])
+                    self._send_json(_cache_history(tracer, limit=limit))
+                elif parsed.path == "/api/tool_lifecycle":
+                    self._send_json(_tool_lifecycle(evidence_graph_path))
+                elif parsed.path == "/api/skill_timeline":
+                    game = parse_qs(parsed.query).get("game", [None])[0]
+                    self._send_json(_skill_timeline(evidence_graph_path, game=game))
+                elif parsed.path == "/api/nashconv":
+                    game = parse_qs(parsed.query).get("game", [None])[0]
+                    self._send_json(_nashconv(eval_root, game=game))
                 else:
                     self.send_error(404, "Not found")
 
@@ -141,6 +160,166 @@ def _read_eval(eval_root: Path, game: str) -> dict[str, Any]:
                 except Exception:
                     continue
         out["skill_timeline"] = rows
+    return out
+
+
+def _policy_versions(graph_path: Path) -> dict[str, Any]:
+    if not graph_path.exists():
+        return {"nodes": [], "edges": [], "note": f"graph not found: {graph_path}"}
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(graph_path))
+        try:
+            cur = conn.execute(
+                "SELECT id, name, parent, skill_set_hash, tool_set_hash, created_at, attrs_json "
+                "FROM policy_version ORDER BY created_at ASC"
+            )
+            nodes: list[dict[str, Any]] = []
+            edges: list[dict[str, str]] = []
+            for r in cur.fetchall():
+                try:
+                    attrs = json.loads(r[6] or "{}")
+                except Exception:
+                    attrs = {}
+                nodes.append({"id": r[0], "name": r[1], "parent": r[2],
+                              "skill_set_hash": r[3], "tool_set_hash": r[4],
+                              "created_at": r[5], "attrs": attrs})
+                if r[2]:
+                    edges.append({"src": r[2], "dst": r[0]})
+        finally:
+            conn.close()
+        return {"nodes": nodes, "edges": edges}
+    except Exception as exc:
+        return {"nodes": [], "edges": [], "error": str(exc)}
+
+
+def _cache_history(tracer: TextArenaRunTracer, *, limit: int = 500) -> dict[str, Any]:
+    path = tracer.decision_frames_path
+    if not path.exists():
+        return {"frames": [], "summary": {"avg_hit_ratio": 0.0, "total_prompt_tokens": 0,
+                                            "total_cached_tokens": 0, "n": 0}}
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines()[-max(1, limit):]:
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        rows.append({
+            "id": obj.get("id"), "step": obj.get("step"),
+            "policy_version": obj.get("policy_version"),
+            "prompt_tokens": int(obj.get("prompt_tokens") or 0),
+            "completion_tokens": int(obj.get("completion_tokens") or 0),
+            "cached_tokens": int(obj.get("cached_tokens") or 0),
+            "cache_hit_ratio": float(obj.get("cache_hit_ratio") or 0.0),
+            "created_at": obj.get("created_at"),
+        })
+    total_p = sum(r["prompt_tokens"] for r in rows)
+    total_c = sum(r["cached_tokens"] for r in rows)
+    avg = (sum(r["cache_hit_ratio"] for r in rows) / len(rows)) if rows else 0.0
+    return {
+        "frames": rows,
+        "summary": {
+            "avg_hit_ratio": round(avg, 4),
+            "total_prompt_tokens": total_p,
+            "total_cached_tokens": total_c,
+            "overall_hit_ratio": round(total_c / total_p, 4) if total_p else 0.0,
+            "n": len(rows),
+        },
+    }
+
+
+def _tool_lifecycle(graph_path: Path) -> dict[str, Any]:
+    if not graph_path.exists():
+        return {"versions": [], "synthesized": [], "counts_by_status": {},
+                "note": f"graph not found: {graph_path}"}
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(graph_path))
+        try:
+            cur = conn.execute(
+                "SELECT tv.id, tv.tool_id, tv.version, tv.status, tv.policy_version, "
+                "       tv.replay_score, tv.ab_score, tv.unit_tests_passed, tv.created_at, t.name "
+                "FROM tool_version tv LEFT JOIN tool t ON t.id = tv.tool_id "
+                "ORDER BY tv.created_at ASC"
+            )
+            versions = [{
+                "id": r[0], "tool_id": r[1], "version": r[2], "status": r[3],
+                "policy_version": r[4], "replay_score": r[5], "ab_score": r[6],
+                "unit_tests_passed": bool(r[7]), "created_at": r[8], "tool_name": r[9],
+            } for r in cur.fetchall()]
+            cur2 = conn.execute(
+                "SELECT id, tool_id, name, status, version, policy_version, "
+                "       replay_score, ab_score, created_at FROM synthesized_tool "
+                "ORDER BY created_at ASC"
+            )
+            synthesized = [{
+                "id": r[0], "tool_id": r[1], "name": r[2], "status": r[3], "version": r[4],
+                "policy_version": r[5], "replay_score": r[6], "ab_score": r[7],
+                "created_at": r[8],
+            } for r in cur2.fetchall()]
+        finally:
+            conn.close()
+        counts: dict[str, int] = {}
+        for v in versions:
+            counts[v["status"]] = counts.get(v["status"], 0) + 1
+        for s in synthesized:
+            counts[s["status"]] = counts.get(s["status"], 0) + 1
+        return {"versions": versions, "synthesized": synthesized, "counts_by_status": counts}
+    except Exception as exc:
+        return {"versions": [], "synthesized": [], "counts_by_status": {}, "error": str(exc)}
+
+
+def _skill_timeline(graph_path: Path, *, game: str | None = None) -> dict[str, Any]:
+    if not graph_path.exists():
+        return {"versions": [], "counts_by_status": {},
+                "note": f"graph not found: {graph_path}"}
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(graph_path))
+        try:
+            q = ("SELECT sv.id, sv.skill_id, sv.version, sv.status, sv.policy_version, "
+                 "       sv.replay_score, sv.ab_score, sv.created_by, sv.created_at, "
+                 "       s.name, s.game_id FROM skill_version sv "
+                 "JOIN skill s ON s.id = sv.skill_id")
+            params: tuple[Any, ...] = ()
+            if game:
+                q += " WHERE s.game_id = ?"
+                params = (game,)
+            q += " ORDER BY sv.created_at ASC"
+            cur = conn.execute(q, params)
+            versions = [{
+                "id": r[0], "skill_id": r[1], "version": r[2], "status": r[3],
+                "policy_version": r[4], "replay_score": r[5], "ab_score": r[6],
+                "created_by": r[7], "created_at": r[8], "skill_name": r[9],
+                "game_id": r[10],
+            } for r in cur.fetchall()]
+        finally:
+            conn.close()
+        counts: dict[str, int] = {}
+        for v in versions:
+            counts[v["status"]] = counts.get(v["status"], 0) + 1
+        return {"versions": versions, "counts_by_status": counts}
+    except Exception as exc:
+        return {"versions": [], "counts_by_status": {}, "error": str(exc)}
+
+
+def _nashconv(eval_root: Path, *, game: str | None = None) -> dict[str, Any]:
+    if game:
+        games = [game]
+    elif eval_root.exists():
+        games = [p.name for p in eval_root.iterdir() if p.is_dir()]
+    else:
+        games = []
+    out: dict[str, Any] = {"games": {}}
+    for g in games:
+        path = eval_root / g / "exploitability.json"
+        if path.exists():
+            try:
+                out["games"][g] = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
     return out
 
 

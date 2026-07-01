@@ -22,6 +22,7 @@ class LLMToolResponse:
     text: str
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     raw: Any = None
+    usage: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -76,7 +77,7 @@ class OpenAIChatLLM:
         api_key_keys.extend(["MCP_API_KEY", "OPENAI_API_KEY", "SCS_LLM_API_KEY"])
         base_keys.extend(["MCP_API_BASE", "OPENAI_BASE_URL", "SCS_LLM_BASE_URL"])
         return cls(
-            model=_first_env(model_keys) or "gpt-4o-mini",
+            model=_first_env(model_keys) or "gpt-5.4",
             api_key=_first_env(api_key_keys),
             base_url=_first_env(base_keys),
         )
@@ -86,7 +87,7 @@ class OpenAIChatLLM:
             raise RuntimeError("Missing API key. Set MCP_API_KEY, OPENAI_API_KEY, or SCS_LLM_API_KEY.")
         client = self._client()
         response = client.chat.completions.create(
-            model=self.model or "gpt-4o-mini",
+            model=self.model or "gpt-5.4",
             temperature=temperature,
             max_tokens=max_tokens,
             response_format={"type": "json_object"},
@@ -112,7 +113,7 @@ class OpenAIChatLLM:
         # NOTE: do not set response_format here; many gateways reject
         # response_format=json_object together with tools=.
         response = client.chat.completions.create(
-            model=self.model or "gpt-4o-mini",
+            model=self.model or "gpt-5.4",
             temperature=temperature,
             max_tokens=max_tokens,
             tools=tools,
@@ -121,7 +122,7 @@ class OpenAIChatLLM:
         )
         message = _response_message(response)
         tool_calls = _normalize_tool_calls(_message_tool_calls(message))
-        return LLMToolResponse(text=_message_text(message), tool_calls=tool_calls, raw=response)
+        return LLMToolResponse(text=_message_text(message), tool_calls=tool_calls, raw=response, usage=_extract_usage(response))
 
     def _client(self):
         try:
@@ -282,6 +283,52 @@ def _first_env(keys: list[str]) -> str | None:
         if value:
             return value
     return None
+
+
+def _extract_usage(response: Any) -> dict[str, int]:
+    """Pull prompt/completion/cached token counts out of a chat-completions response.
+
+    Falls back to zeros when the gateway does not report any of these fields.
+    The ``cached_tokens`` value is sourced from
+    ``usage.prompt_tokens_details.cached_tokens`` (OpenAI cache-aware schema);
+    some gateways expose it under ``usage.cached_tokens`` directly.
+    """
+    usage_obj: Any = None
+    if isinstance(response, dict):
+        usage_obj = response.get("usage")
+    else:
+        usage_obj = getattr(response, "usage", None)
+    if usage_obj is None:
+        return {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0}
+
+    def _get(field: str, default: int = 0) -> int:
+        if isinstance(usage_obj, dict):
+            value = usage_obj.get(field, default)
+        else:
+            value = getattr(usage_obj, field, default)
+        try:
+            return int(value or 0)
+        except Exception:
+            return default
+
+    prompt_tokens = _get("prompt_tokens")
+    completion_tokens = _get("completion_tokens")
+    cached_tokens = _get("cached_tokens", 0)
+    details: Any = None
+    if isinstance(usage_obj, dict):
+        details = usage_obj.get("prompt_tokens_details")
+    else:
+        details = getattr(usage_obj, "prompt_tokens_details", None)
+    if details is not None:
+        if isinstance(details, dict):
+            cached_tokens = int(details.get("cached_tokens", cached_tokens) or 0)
+        else:
+            cached_tokens = int(getattr(details, "cached_tokens", cached_tokens) or 0)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "cached_tokens": cached_tokens,
+    }
 
 
 def _extract_json_array_after_marker(text: str, marker: str) -> list[dict[str, Any]]:
